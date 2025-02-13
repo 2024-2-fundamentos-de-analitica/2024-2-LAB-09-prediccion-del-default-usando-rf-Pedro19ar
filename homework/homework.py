@@ -92,3 +92,125 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import os
+import json
+import gzip
+import pickle
+import zipfile
+from glob import glob
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    precision_score, balanced_accuracy_score, recall_score, f1_score, confusion_matrix
+)
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+
+def load_datasets(directory):
+    """Carga archivos CSV dentro de archivos ZIP desde un directorio dado."""
+    datasets = []
+    for filepath in glob(f"{directory}/*"):
+        with zipfile.ZipFile(filepath, "r") as zf:
+            for filename in zf.namelist():
+                with zf.open(filename) as f:
+                    datasets.append(pd.read_csv(f, sep=",", index_col=0))
+    return datasets
+
+def prepare_output_dir(output_dir):
+    """Elimina y recrea el directorio de salida si existe."""
+    if os.path.exists(output_dir):
+        for file in glob(f"{output_dir}/*"):
+            os.remove(file)
+        os.rmdir(output_dir)
+    os.makedirs(output_dir)
+
+def clean_dataset(df):
+    """Aplica limpieza de datos eliminando valores no válidos."""
+    df = df.copy()
+    df.rename(columns={"default payment next month": "default"}, inplace=True)
+    df = df[df["MARRIAGE"] != 0]
+    df = df[df["EDUCATION"] != 0]
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda x: min(x, 4))
+    return df.dropna()
+
+def separate_features_target(df):
+    """Divide el dataset en características y variable objetivo."""
+    return df.drop(columns=["default"]), df["default"]
+
+def build_pipeline():
+    """Crea una pipeline para procesamiento y clasificación."""
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    preprocessor = ColumnTransformer(
+        [("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features)],
+        remainder="passthrough",
+    )
+    return Pipeline([
+        ("preprocessor", preprocessor),
+        ("classifier", RandomForestClassifier(random_state=42)),
+    ])
+
+def configure_estimator(pipeline):
+    """Configura la búsqueda de hiperparámetros."""
+    param_grid = {
+        "classifier__n_estimators": [100, 200, 500],
+        "classifier__max_depth": [None, 5, 10],
+        "classifier__min_samples_split": [2, 5],
+        "classifier__min_samples_leaf": [1, 2],
+    }
+    return GridSearchCV(
+        pipeline, param_grid, cv=10, scoring="balanced_accuracy", n_jobs=-1, refit=True, verbose=2
+    )
+
+def save_model(filepath, estimator):
+    """Guarda el modelo entrenado en un archivo comprimido."""
+    prepare_output_dir("files/models/")
+    with gzip.open(filepath, "wb") as f:
+        pickle.dump(estimator, f)
+
+def compute_metrics(dataset_name, y_true, y_pred):
+    """Calcula métricas de evaluación."""
+    return {
+        "type": "metrics",
+        "dataset": dataset_name,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+    }
+
+def compute_confusion_matrix(dataset_name, y_true, y_pred):
+    """Genera la matriz de confusión."""
+    cm = confusion_matrix(y_true, y_pred)
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_name,
+        "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
+        "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])},
+    }
+
+def main():
+    """Ejecuta el proceso de carga, entrenamiento y evaluación del modelo."""
+    test_df, train_df = [clean_dataset(df) for df in load_datasets("files/input")]  
+    x_train, y_train = separate_features_target(train_df)
+    x_test, y_test = separate_features_target(test_df)
+    pipeline = build_pipeline()
+    estimator = configure_estimator(pipeline)
+    estimator.fit(x_train, y_train)
+    save_model("files/models/model.pkl.gz", estimator)
+    
+    metrics = [
+        compute_metrics("train", y_train, estimator.predict(x_train)),
+        compute_metrics("test", y_test, estimator.predict(x_test)),
+        compute_confusion_matrix("train", y_train, estimator.predict(x_train)),
+        compute_confusion_matrix("test", y_test, estimator.predict(x_test)),
+    ]
+    os.makedirs("files/output/", exist_ok=True)
+    with open("files/output/metrics.json", "w", encoding="utf-8") as file:
+        file.writelines(json.dumps(m) + "\n" for m in metrics)
+
+if __name__ == "__main__":
+    main()
